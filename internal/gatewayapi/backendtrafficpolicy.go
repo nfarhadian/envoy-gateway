@@ -6,14 +6,18 @@
 package gatewayapi
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	perr "github.com/pkg/errors"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/descriptorpb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +41,9 @@ const (
 	MaxConsistentHashTableSize = 5000011 // https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#config-cluster-v3-cluster-maglevlbconfig
 	// ResponseBodyConfigMapKey is the key used in ConfigMaps to store custom response body data
 	ResponseBodyConfigMapKey = "response.body"
+
+	// protoDescriptorKey is the preferred ConfigMap key holding the FileDescriptorSet.
+	protoDescriptorKey = "proto-descriptor"
 )
 
 // BTPRoutingTypeIndex holds RoutingType values from BackendTrafficPolicies, keyed by attachment
@@ -1473,25 +1480,26 @@ func (t *Translator) mergeBackendTrafficPolicy(routePolicy, gwPolicy *egv1a1.Bac
 // policy's own namespace.
 func (t *Translator) buildTrafficFeatures(policy *egv1a1.BackendTrafficPolicy, owners *backendTrafficPolicyOwners) (*ir.TrafficFeatures, error) {
 	var (
-		rl          *ir.RateLimit
-		bl          *ir.BandwidthLimit
-		lb          *ir.LoadBalancer
-		pp          *ir.ProxyProtocol
-		hc          *ir.HealthCheck
-		cb          *ir.CircuitBreaker
-		fi          *ir.FaultInjection
-		ac          *ir.AdmissionControl
-		to          *ir.Timeout
-		ka          *ir.TCPKeepalive
-		rt          *ir.Retry
-		bc          *ir.BackendConnection
-		ds          *ir.DNS
-		h2          *ir.HTTP2Settings
-		ro          *ir.ResponseOverride
-		rb          *ir.RequestBuffer
-		cp          []*ir.Compression
-		httpUpgrade []ir.HTTPUpgradeConfig
-		err, errs   error
+		rl                 *ir.RateLimit
+		bl                 *ir.BandwidthLimit
+		lb                 *ir.LoadBalancer
+		pp                 *ir.ProxyProtocol
+		hc                 *ir.HealthCheck
+		cb                 *ir.CircuitBreaker
+		fi                 *ir.FaultInjection
+		ac                 *ir.AdmissionControl
+		to                 *ir.Timeout
+		ka                 *ir.TCPKeepalive
+		rt                 *ir.Retry
+		bc                 *ir.BackendConnection
+		ds                 *ir.DNS
+		h2                 *ir.HTTP2Settings
+		ro                 *ir.ResponseOverride
+		rb                 *ir.RequestBuffer
+		cp                 []*ir.Compression
+		httpUpgrade        []ir.HTTPUpgradeConfig
+		grpcJSONTranscoder *ir.GRPCJSONTranscoder
+		err, errs          error
 	)
 
 	if policy.Spec.RateLimit != nil {
@@ -1570,6 +1578,11 @@ func (t *Translator) buildTrafficFeatures(policy *egv1a1.BackendTrafficPolicy, o
 		errs = errors.Join(errs, err)
 	}
 
+	if grpcJSONTranscoder, err = t.buildGRPCJSONTranscoder(policy, owners); err != nil {
+		err = perr.WithMessage(err, "GRPCJSONTranscoder")
+		errs = errors.Join(errs, err)
+	}
+
 	ds = translateDNS(&policy.Spec.ClusterSettings, utils.NamespacedName(policy).String())
 
 	return &ir.TrafficFeatures{
@@ -1585,15 +1598,16 @@ func (t *Translator) buildTrafficFeatures(policy *egv1a1.BackendTrafficPolicy, o
 			HTTP2:             h2,
 			DNS:               ds,
 		},
-		RateLimit:        rl,
-		BandwidthLimit:   bl,
-		FaultInjection:   fi,
-		Retry:            rt,
-		ResponseOverride: ro,
-		Compression:      cp,
-		HTTPUpgrade:      httpUpgrade,
-		Telemetry:        buildBackendTelemetry(policy.Spec.Telemetry),
-		RequestBuffer:    rb,
+		RateLimit:          rl,
+		BandwidthLimit:     bl,
+		FaultInjection:     fi,
+		Retry:              rt,
+		ResponseOverride:   ro,
+		Compression:        cp,
+		HTTPUpgrade:        httpUpgrade,
+		Telemetry:          buildBackendTelemetry(policy.Spec.Telemetry),
+		RequestBuffer:      rb,
+		GRPCJSONTranscoder: grpcJSONTranscoder,
 	}, errs
 }
 
@@ -2508,7 +2522,8 @@ func (t *Translator) getCustomResponseBody(
 // merged field that references other objects, so references resolve against the owner's
 // namespace. Mirrors the field-owner pattern used for SecurityPolicy.
 type backendTrafficPolicyOwners struct {
-	responseOverride *egv1a1.BackendTrafficPolicy
+	responseOverride   *egv1a1.BackendTrafficPolicy
+	grpcJSONTranscoder *egv1a1.BackendTrafficPolicy
 }
 
 // buildBackendTrafficPolicyOwners picks the owner of each merged field: the route policy
@@ -2518,8 +2533,13 @@ func buildBackendTrafficPolicyOwners(route, parent *egv1a1.BackendTrafficPolicy)
 	if len(route.Spec.ResponseOverride) > 0 {
 		responseOverrideOwner = route
 	}
+	grpcJSONTranscoderOwner := parent
+	if route.Spec.GRPCJSONTranscoder != nil {
+		grpcJSONTranscoderOwner = route
+	}
 	return &backendTrafficPolicyOwners{
-		responseOverride: responseOverrideOwner,
+		responseOverride:   responseOverrideOwner,
+		grpcJSONTranscoder: grpcJSONTranscoderOwner,
 	}
 }
 
@@ -2633,4 +2653,221 @@ func buildRouteStatName(routeStatName string, metadata *ir.ResourceMetadata) *st
 	}
 
 	return &statName
+}
+
+func (t *Translator) buildGRPCJSONTranscoder(
+	policy *egv1a1.BackendTrafficPolicy, owners *backendTrafficPolicyOwners,
+) (*ir.GRPCJSONTranscoder, error) {
+	if policy.Spec.GRPCJSONTranscoder == nil {
+		return nil, nil
+	}
+
+	cfg := policy.Spec.GRPCJSONTranscoder
+
+	// A merged policy carries the route policy's ObjectMeta, so resolve the ConfigMap and
+	// the filter name against whichever policy actually set the field.
+	owner := policy
+	if owners != nil && owners.grpcJSONTranscoder != nil {
+		owner = owners.grpcJSONTranscoder
+	}
+
+	// Parsing here turns a bad descriptor into a policy status condition rather than a
+	// rejected listener.
+	descriptor, err := t.loadProtoDescriptor(cfg.ProtoDescriptor, owner.Namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	services, err := resolveTranscodedServices(descriptor, cfg.Services)
+	if err != nil {
+		return nil, err
+	}
+
+	var printOptions *ir.JSONPrintOptions
+	if cfg.PrintOptions != nil {
+		printOptions = &ir.JSONPrintOptions{
+			AddWhitespace:              cfg.PrintOptions.AddWhitespace,
+			AlwaysPrintPrimitiveFields: cfg.PrintOptions.AlwaysPrintPrimitiveFields,
+			AlwaysPrintEnumsAsInts:     cfg.PrintOptions.AlwaysPrintEnumsAsInts,
+			PreserveProtoFieldNames:    cfg.PrintOptions.PreserveProtoFieldNames,
+		}
+	}
+
+	return &ir.GRPCJSONTranscoder{
+		Name:                         irConfigName(owner),
+		ProtoDescriptorBin:           descriptor.bin,
+		Services:                     services,
+		PrintOptions:                 printOptions,
+		MatchIncomingRequestRoute:    cfg.MatchIncomingRequestRoute,
+		IgnoredQueryParameters:       cfg.IgnoredQueryParameters,
+		AutoMapping:                  cfg.AutoMapping,
+		IgnoreUnknownQueryParameters: cfg.IgnoreUnknownQueryParameters,
+		ConvertGRPCStatus:            cfg.ConvertGRPCStatus,
+	}, nil
+}
+
+// parsedProtoDescriptor is a descriptor that has been decoded, validated, and had its
+// service names extracted.
+type parsedProtoDescriptor struct {
+	bin []byte
+	// all is every service declared in the set; roots omits those declared by files that
+	// another file imports.
+	all   sets.Set[string]
+	roots []string
+}
+
+// loadProtoDescriptor returns the descriptor referenced by protoDesc, decoding and
+// validating it once per translation.
+func (t *Translator) loadProtoDescriptor(
+	protoDesc egv1a1.ProtoDescriptor, namespace string,
+) (*parsedProtoDescriptor, error) {
+	ref := protoDesc.ValueRef
+	if g, k := string(ref.Group), string(ref.Kind); g != "" || k != resource.KindConfigMap {
+		return nil, fmt.Errorf("unsupported valueRef %s/%s, only ConfigMap is supported", g, k)
+	}
+
+	key := types.NamespacedName{Namespace: namespace, Name: string(ref.Name)}
+	if d, ok := t.protoDescriptors[key]; ok {
+		return d, nil
+	}
+
+	bin, err := t.readProtoDescriptor(key)
+	if err != nil {
+		return nil, err
+	}
+
+	fds := &descriptorpb.FileDescriptorSet{}
+	if err := proto.Unmarshal(bin, fds); err != nil {
+		return nil, fmt.Errorf("failed to parse proto descriptor as a FileDescriptorSet: %w", err)
+	}
+	if err := validateDescriptorClosure(fds); err != nil {
+		return nil, err
+	}
+
+	// Imported files can declare services of their own (google.longrunning.Operations, for
+	// one). Only files nothing else imports were compiled by the user.
+	imported := sets.New[string]()
+	for _, file := range fds.GetFile() {
+		imported.Insert(file.GetDependency()...)
+	}
+
+	d := &parsedProtoDescriptor{bin: bin, all: sets.New[string]()}
+	for _, file := range fds.GetFile() {
+		for _, svc := range file.GetService() {
+			name := svc.GetName()
+			if pkg := file.GetPackage(); pkg != "" {
+				name = pkg + "." + name
+			}
+			d.all.Insert(name)
+			if !imported.Has(file.GetName()) {
+				d.roots = append(d.roots, name)
+			}
+		}
+	}
+	if d.all.Len() == 0 {
+		return nil, errors.New("proto descriptor contains no gRPC services")
+	}
+
+	if t.protoDescriptors == nil {
+		t.protoDescriptors = map[types.NamespacedName]*parsedProtoDescriptor{}
+	}
+	t.protoDescriptors[key] = d
+	return d, nil
+}
+
+// readProtoDescriptor pulls the raw FileDescriptorSet out of the referenced ConfigMap.
+func (t *Translator) readProtoDescriptor(key types.NamespacedName) ([]byte, error) {
+	cm := t.GetConfigMap(key.Namespace, key.Name)
+	if cm == nil {
+		return nil, fmt.Errorf("proto descriptor ConfigMap %s not found", key)
+	}
+
+	// `kubectl create configmap --from-file` puts a descriptor in BinaryData, already decoded.
+	if v, ok := cm.BinaryData[protoDescriptorKey]; ok {
+		return v, nil
+	}
+	if v, ok := cm.Data[protoDescriptorKey]; ok {
+		return decodeProtoDescriptor(v)
+	}
+	if len(cm.BinaryData) == 1 {
+		for _, v := range cm.BinaryData {
+			return v, nil
+		}
+	}
+	if len(cm.Data) == 1 {
+		for _, v := range cm.Data {
+			return decodeProtoDescriptor(v)
+		}
+	}
+
+	return nil, fmt.Errorf(
+		"proto descriptor not found in ConfigMap %s: expected key %q, or exactly one entry",
+		key, protoDescriptorKey)
+}
+
+// decodeProtoDescriptor base64-decodes a descriptor carried as text. Whitespace is
+// stripped first because YAML block scalars fold in newlines.
+func decodeProtoDescriptor(s string) ([]byte, error) {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if !unicode.IsSpace(r) {
+			b.WriteRune(r)
+		}
+	}
+
+	bin, err := base64.StdEncoding.DecodeString(b.String())
+	if err != nil {
+		return nil, fmt.Errorf("proto descriptor is not valid base64: %w", err)
+	}
+	if len(bin) == 0 {
+		return nil, errors.New("proto descriptor is empty")
+	}
+	return bin, nil
+}
+
+// validateDescriptorClosure ensures every imported file is present in the set. Envoy
+// reports only "Unable to build proto descriptor pool" when one is missing.
+func validateDescriptorClosure(fds *descriptorpb.FileDescriptorSet) error {
+	present := sets.New[string]()
+	for _, f := range fds.GetFile() {
+		present.Insert(f.GetName())
+	}
+
+	missing := sets.New[string]()
+	for _, f := range fds.GetFile() {
+		for _, dep := range f.GetDependency() {
+			if !present.Has(dep) {
+				missing.Insert(fmt.Sprintf("%s (imported by %s)", dep, f.GetName()))
+			}
+		}
+	}
+	if missing.Len() > 0 {
+		return fmt.Errorf(
+			"proto descriptor is missing imported files: %s; regenerate it with "+
+				"`protoc --include_imports --descriptor_set_out=...`",
+			strings.Join(sets.List(missing), ", "))
+	}
+	return nil
+}
+
+// resolveTranscodedServices returns the services to transcode. Envoy treats an empty list
+// as "filter disabled", so an omitted list is expanded rather than passed through.
+func resolveTranscodedServices(d *parsedProtoDescriptor, want []string) ([]string, error) {
+	if len(want) == 0 {
+		if len(d.roots) == 0 {
+			return nil, errors.New(
+				"every gRPC service in the proto descriptor comes from an imported file; " +
+					"set services explicitly to choose which ones to transcode")
+		}
+		return d.roots, nil
+	}
+
+	for _, svc := range want {
+		if !d.all.Has(svc) {
+			return nil, fmt.Errorf("service %q not found in the proto descriptor, available services: %s",
+				svc, strings.Join(sets.List(d.all), ", "))
+		}
+	}
+	return want, nil
 }

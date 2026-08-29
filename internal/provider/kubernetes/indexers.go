@@ -1156,6 +1156,19 @@ func configMapBtpIndexFunc(rawObj client.Object) []string {
 			}
 		}
 	}
+
+	if t := btp.Spec.GRPCJSONTranscoder; t != nil {
+		ref := t.ProtoDescriptor.ValueRef
+		if string(ref.Group) == "" && string(ref.Kind) == resource.KindConfigMap {
+			configMapReferences = append(configMapReferences,
+				types.NamespacedName{
+					Namespace: btp.Namespace,
+					Name:      string(ref.Name),
+				}.String(),
+			)
+		}
+	}
+
 	return configMapReferences
 }
 

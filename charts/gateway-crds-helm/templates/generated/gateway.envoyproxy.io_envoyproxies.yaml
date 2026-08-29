@@ -530,6 +530,7 @@ spec:
                       - envoy.filters.http.bandwidth_limit
                       - envoy.filters.http.grpc_web
                       - envoy.filters.http.grpc_stats
+                      - envoy.filters.http.grpc_json_transcoder
                       - envoy.filters.http.credential_injector
                       - envoy.filters.http.compressor
                       - envoy.filters.http.dynamic_forward_proxy
@@ -563,6 +564,7 @@ spec:
                       - envoy.filters.http.bandwidth_limit
                       - envoy.filters.http.grpc_web
                       - envoy.filters.http.grpc_stats
+                      - envoy.filters.http.grpc_json_transcoder
                       - envoy.filters.http.credential_injector
                       - envoy.filters.http.compressor
                       - envoy.filters.http.dynamic_forward_proxy
@@ -594,6 +596,7 @@ spec:
                       - envoy.filters.http.bandwidth_limit
                       - envoy.filters.http.grpc_web
                       - envoy.filters.http.grpc_stats
+                      - envoy.filters.http.grpc_json_transcoder
                       - envoy.filters.http.credential_injector
                       - envoy.filters.http.compressor
                       - envoy.filters.http.dynamic_forward_proxy

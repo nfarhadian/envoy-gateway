@@ -153,6 +153,12 @@ type BackendTrafficPolicySpec struct {
 	//
 	// +optional
 	RoutingType *RoutingType `json:"routingType,omitempty"`
+
+	// GRPCJSONTranscoder defines the gRPC-JSON transcoding configuration.
+	// This enables automatic transcoding between JSON/HTTP and gRPC protocols.
+	//
+	// +optional
+	GRPCJSONTranscoder *GRPCJSONTranscoder `json:"grpcJsonTranscoder,omitempty"`
 }
 
 type BackendTelemetry struct {

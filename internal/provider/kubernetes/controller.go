@@ -1641,6 +1641,34 @@ func (r *gatewayAPIReconciler) processBtpConfigMapRefs(
 				}
 			}
 		}
+
+		if t := policy.Spec.GRPCJSONTranscoder; t != nil {
+			ref := t.ProtoDescriptor.ValueRef
+			if string(ref.Group) == "" && string(ref.Kind) == resource.KindConfigMap {
+				configMap := new(corev1.ConfigMap)
+				err := r.client.Get(ctx,
+					types.NamespacedName{Namespace: policy.Namespace, Name: string(ref.Name)},
+					configMap,
+				)
+				if err != nil {
+					if isTransientError(err) {
+						return err
+					}
+					r.log.Error(err,
+						"failed to process GRPCJSONTranscoder ValueRef for BackendTrafficPolicy",
+						"policy", policy, "ValueRef", ref.Name)
+					// Translation marks the policy invalid; don't add an empty ConfigMap.
+					continue
+				}
+
+				resourceMap.allAssociatedNamespaces.Insert(policy.Namespace)
+				if !resourceMap.allAssociatedConfigMaps.Has(utils.NamespacedName(configMap).String()) {
+					resourceMap.allAssociatedConfigMaps.Insert(utils.NamespacedName(configMap).String())
+					resourceTree.ConfigMaps = append(resourceTree.ConfigMaps, configMap)
+					r.log.Info("processing ConfigMap", "namespace", policy.Namespace, "name", string(ref.Name))
+				}
+			}
+		}
 	}
 	return nil
 }
