@@ -4244,13 +4244,13 @@ func TestBackendTrafficPolicyGRPCJSONTranscoder(t *testing.T) {
 		},
 		Spec: egv1a1.BackendTrafficPolicySpec{
 			PolicyTargetReferences: egv1a1.PolicyTargetReferences{
-				TargetRef: &gwapiv1.LocalPolicyTargetReferenceWithSectionName{
+				TargetRefs: []gwapiv1.LocalPolicyTargetReferenceWithSectionName{{
 					LocalPolicyTargetReference: gwapiv1.LocalPolicyTargetReference{
 						Group: gwapiv1.Group("gateway.networking.k8s.io"),
 						Kind:  gwapiv1.Kind("HTTPRoute"),
 						Name:  gwapiv1.ObjectName("httproute"),
 					},
-				},
+				}},
 			},
 		},
 	}
