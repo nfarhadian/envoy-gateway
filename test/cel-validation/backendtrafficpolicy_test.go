@@ -4234,3 +4234,104 @@ func TestBackendTrafficPolicyTarget(t *testing.T) {
 		})
 	}
 }
+
+func TestBackendTrafficPolicyGRPCJSONTranscoder(t *testing.T) {
+	ctx := context.Background()
+	baseBTP := egv1a1.BackendTrafficPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "btp",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: egv1a1.BackendTrafficPolicySpec{
+			PolicyTargetReferences: egv1a1.PolicyTargetReferences{
+				TargetRef: &gwapiv1.LocalPolicyTargetReferenceWithSectionName{
+					LocalPolicyTargetReference: gwapiv1.LocalPolicyTargetReference{
+						Group: gwapiv1.Group("gateway.networking.k8s.io"),
+						Kind:  gwapiv1.Kind("HTTPRoute"),
+						Name:  gwapiv1.ObjectName("httproute"),
+					},
+				},
+			},
+		},
+	}
+
+	transcoder := func(ref gwapiv1.LocalObjectReference) *egv1a1.GRPCJSONTranscoder {
+		return &egv1a1.GRPCJSONTranscoder{
+			ProtoDescriptor: egv1a1.ProtoDescriptor{ValueRef: ref},
+			Services:        []string{"grpcecho.GrpcEcho"},
+		}
+	}
+
+	cases := []struct {
+		desc       string
+		mutate     func(btp *egv1a1.BackendTrafficPolicy)
+		wantErrors []string
+	}{
+		{
+			desc: "core ConfigMap is accepted",
+			mutate: func(btp *egv1a1.BackendTrafficPolicy) {
+				btp.Spec.GRPCJSONTranscoder = transcoder(gwapiv1.LocalObjectReference{
+					Kind: "ConfigMap",
+					Name: "descriptor",
+				})
+			},
+			wantErrors: []string{},
+		},
+		{
+			desc: "explicit empty group is accepted",
+			mutate: func(btp *egv1a1.BackendTrafficPolicy) {
+				btp.Spec.GRPCJSONTranscoder = transcoder(gwapiv1.LocalObjectReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "descriptor",
+				})
+			},
+			wantErrors: []string{},
+		},
+		{
+			desc: "non-core group is rejected",
+			mutate: func(btp *egv1a1.BackendTrafficPolicy) {
+				btp.Spec.GRPCJSONTranscoder = transcoder(gwapiv1.LocalObjectReference{
+					Group: "apps",
+					Kind:  "ConfigMap",
+					Name:  "descriptor",
+				})
+			},
+			wantErrors: []string{"valueRef must refer to a core ConfigMap"},
+		},
+		{
+			desc: "non-ConfigMap kind is rejected",
+			mutate: func(btp *egv1a1.BackendTrafficPolicy) {
+				btp.Spec.GRPCJSONTranscoder = transcoder(gwapiv1.LocalObjectReference{
+					Kind: "Secret",
+					Name: "descriptor",
+				})
+			},
+			wantErrors: []string{"valueRef must refer to a core ConfigMap"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			btp := baseBTP.DeepCopy()
+			btp.Name = fmt.Sprintf("btp-%v", time.Now().UnixNano())
+
+			tc.mutate(btp)
+			err := c.Create(ctx, btp)
+
+			if (len(tc.wantErrors) != 0) != (err != nil) {
+				t.Fatalf("Unexpected response while creating BackendTrafficPolicy; got err=\n%v\n;want error=%v", err, tc.wantErrors)
+			}
+
+			var missingErrorStrings []string
+			for _, wantError := range tc.wantErrors {
+				if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(wantError)) {
+					missingErrorStrings = append(missingErrorStrings, wantError)
+				}
+			}
+			if len(missingErrorStrings) != 0 {
+				t.Errorf("Unexpected response while creating BackendTrafficPolicy; got err=\n%v\n;missing strings within error=%q", err, missingErrorStrings)
+			}
+		})
+	}
+}

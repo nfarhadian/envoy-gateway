@@ -2866,8 +2866,20 @@ func resolveTranscodedServices(d *parsedProtoDescriptor, want []string) ([]strin
 	for _, svc := range want {
 		if !d.all.Has(svc) {
 			return nil, fmt.Errorf("service %q not found in the proto descriptor, available services: %s",
-				svc, strings.Join(sets.List(d.all), ", "))
+				svc, availableServices(d.all))
 		}
 	}
 	return want, nil
+}
+
+// availableServices renders a descriptor's services for an error message. The list is bounded
+// because the message ends up in a status condition, which the API server caps at 32Ki.
+func availableServices(all sets.Set[string]) string {
+	const shown = 10
+
+	list := sets.List(all)
+	if len(list) <= shown {
+		return strings.Join(list, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(list[:shown], ", "), len(list)-shown)
 }

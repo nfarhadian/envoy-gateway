@@ -7,6 +7,7 @@ package gatewayapi
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
@@ -128,6 +130,16 @@ func TestResolveTranscodedServices(t *testing.T) {
 	t.Run("unknown service is rejected", func(t *testing.T) {
 		_, err := resolveTranscodedServices(mustParse(t, bin), []string{"does.not.Exist"})
 		require.ErrorContains(t, err, `service "does.not.Exist" not found`)
+	})
+
+	t.Run("available service list is bounded for status conditions", func(t *testing.T) {
+		all := sets.New[string]()
+		for i := range 25 {
+			all.Insert(fmt.Sprintf("pkg.v1.Service%02d", i))
+		}
+		_, err := resolveTranscodedServices(&parsedProtoDescriptor{all: all}, []string{"nope"})
+		require.ErrorContains(t, err, "and 15 more")
+		require.NotContains(t, err.Error(), "Service24")
 	})
 
 	t.Run("garbage descriptor is rejected", func(t *testing.T) {
